@@ -6,6 +6,8 @@ dist/
 .env
 .env.*
 !.env.example
+azure_stt_openai.env
+!azure_stt_openai.env.template
 
 # Local SQLite database
 prisma/*.db

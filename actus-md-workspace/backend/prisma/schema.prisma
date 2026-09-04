@@ -26,6 +26,15 @@ model ClinicalNote {
   id        String   @id @default(uuid())
   sessionId String
   session   Session  @relation(fields: [sessionId], references: [id])
-  content   String // Structured JSON SOAP note
+  patientId String
+  patient   Patient  @relation(fields: [patientId], references: [id])
+  content   String // Structured JSON medical document (SOAP note, Clinic Note, etc.)
   createdAt DateTime @default(now())
+}
+
+model Patient {
+  id                String         @id @default(uuid())
+  patientIdentifier String         @unique
+  createdAt         DateTime       @default(now())
+  clinicalNotes     ClinicalNote[]
 }

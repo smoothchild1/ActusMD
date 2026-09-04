@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './loadEnv';
 
 import http from 'http';
 import path from 'path';

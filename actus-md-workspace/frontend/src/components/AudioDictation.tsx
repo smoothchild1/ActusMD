@@ -9,7 +9,11 @@ import { connectSocket, socket } from '@/lib/socket';
  *
  *  - Captures raw 16 kHz / 16-bit / mono PCM via {@link pcmRecorder}.
  *  - Streams each chunk to the backend as a binary `audioChunk` socket event.
- *  - Emits `audioStop` when the clinician stops, triggering note generation.
+ *  - Emits `audioStop` when the clinician stops; the backend only finalizes
+ *    the transcript at that point (no AI call) and replies with
+ *    `transcriptFinalized`, which is handed to the parent via
+ *    `onTranscriptFinalized` so it can be bundled into a later
+ *    `generateDocument` request.
  *  - Renders `transcriptUpdate` events (partial + finalized) as live feedback.
  */
 
@@ -18,13 +22,27 @@ interface TranscriptUpdate {
   final: boolean;
 }
 
-export function AudioDictation() {
+interface TranscriptFinalized {
+  transcript: string;
+}
+
+interface AudioDictationProps {
+  /** Called with the authoritative transcript once the backend finalizes it. */
+  onTranscriptFinalized?: (transcript: string) => void;
+}
+
+export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [finalText, setFinalText] = useState('');
   const [partialText, setPartialText] = useState('');
   const chunkCount = useRef(0);
+
+  // Kept in a ref so the socket listener effect below doesn't need to
+  // re-subscribe every time the parent passes a new callback identity.
+  const onTranscriptFinalizedRef = useRef(onTranscriptFinalized);
+  onTranscriptFinalizedRef.current = onTranscriptFinalized;
 
   useEffect(() => {
     function onTranscriptUpdate(update: TranscriptUpdate) {
@@ -38,12 +56,17 @@ export function AudioDictation() {
     function onTranscriptError(message: unknown) {
       setError(typeof message === 'string' ? message : 'Transcription error.');
     }
+    function onTranscriptFinalized(payload: TranscriptFinalized) {
+      onTranscriptFinalizedRef.current?.(payload?.transcript ?? '');
+    }
 
     socket.on('transcriptUpdate', onTranscriptUpdate);
     socket.on('transcriptError', onTranscriptError);
+    socket.on('transcriptFinalized', onTranscriptFinalized);
     return () => {
       socket.off('transcriptUpdate', onTranscriptUpdate);
       socket.off('transcriptError', onTranscriptError);
+      socket.off('transcriptFinalized', onTranscriptFinalized);
     };
   }, []);
 

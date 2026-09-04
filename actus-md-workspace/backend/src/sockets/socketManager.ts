@@ -5,7 +5,7 @@ import {
   type SpeechStreamSession,
 } from '../services/azureSpeech';
 import { prisma } from '../services/db';
-import { generateSoapNote } from '../services/azureOpenAI';
+import { generateMedicalDocument, type DocumentImageInput, type TemplateType } from '../services/azureOpenAI';
 
 /**
  * Socket.io wiring for ActusMD.
@@ -13,14 +13,32 @@ import { generateSoapNote } from '../services/azureOpenAI';
  *  - Every connection must present a `userId` (handshake auth or query).
  *  - The socket joins a room named after that `userId` so all of a clinician's
  *    devices share one channel.
- *  - `audioChunk`      -> streamed to Azure Speech; transcripts are broadcast
- *                         back to the room as `transcriptUpdate`.
- *  - `uiStateChange`   -> relayed to the user's *other* devices to keep the UI
- *                         in sync across phone / tablet / web.
+ *  - `audioChunk`          -> streamed to Azure Speech; transcripts are broadcast
+ *                             back to the room as `transcriptUpdate`.
+ *  - `audioStop`           -> finalizes the transcript only, emitting
+ *                             `transcriptFinalized`. Does not call the AI.
+ *  - `generateDocument`    -> takes a finalized payload (transcript, images,
+ *                             free text, template, patient) and produces +
+ *                             persists the AI document, emitting `uiStateChange`.
+ *  - `uiStateChange`       -> relayed to the user's *other* devices to keep the UI
+ *                             in sync across phone / tablet / web.
  */
 
 interface HandshakeAuth {
   userId?: string;
+}
+
+interface AudioStopPayload {
+  sessionId?: string;
+}
+
+interface GenerateDocumentPayload {
+  transcript?: string;
+  images?: DocumentImageInput[];
+  freeText?: string;
+  templateType?: TemplateType;
+  patientIdentifier?: string;
+  sessionId?: string;
 }
 
 export function setupSockets(io: Server): void {
@@ -63,24 +81,57 @@ export function setupSockets(io: Server): void {
       return speech;
     };
 
-    const stopSpeech = async (payload?: { sessionId?: string, patientContext?: string, images?: any[] }) => {
-      if (!speech) return;
-      const sessionObj = speech;
-      speech = null;
-      await sessionObj.stop().catch(() => undefined);
+    // Stops the STT session and hands the finalized transcript back to the
+    // client. No AI call and no persistence happens here - that is entirely
+    // deferred to `generateDocument`, which the client triggers explicitly
+    // once it has a patient identifier and template selected.
+    const finalizeTranscript = async (payload?: AudioStopPayload): Promise<void> => {
+      if (speech) {
+        const sessionObj = speech;
+        speech = null;
+        await sessionObj.stop().catch(() => undefined);
+      }
 
       const transcript = fullTranscript.trim();
       fullTranscript = '';
 
-      if (!transcript && !(payload?.images?.length)) {
+      io.to(userId).emit('transcriptFinalized', {
+        transcript,
+        sessionId: payload?.sessionId,
+      });
+    };
+
+    const generateDocument = async (payload: GenerateDocumentPayload): Promise<void> => {
+      const transcript = payload?.transcript?.trim() ?? '';
+      const freeText = payload?.freeText?.trim();
+      const patientIdentifier = payload?.patientIdentifier?.trim();
+      const templateType = payload?.templateType?.trim();
+
+      if (!patientIdentifier) {
+        io.to(userId).emit('transcriptError', 'A patient identifier is required to generate a document.');
+        return;
+      }
+      if (!templateType) {
+        io.to(userId).emit('transcriptError', 'A template type is required to generate a document.');
+        return;
+      }
+      if (!transcript && !freeText && !(payload?.images?.length)) {
+        io.to(userId).emit('transcriptError', 'Nothing to generate a document from.');
         return;
       }
 
       try {
-        const soapNote = await generateSoapNote({
+        const document = await generateMedicalDocument({
           transcript,
-          patientContext: payload?.patientContext,
+          patientContext: freeText,
           images: payload?.images,
+          templateType,
+        });
+
+        const patient = await prisma.patient.upsert({
+          where: { patientIdentifier },
+          update: {},
+          create: { patientIdentifier },
         });
 
         let sessionId = payload?.sessionId;
@@ -99,13 +150,14 @@ export function setupSockets(io: Server): void {
         const note = await prisma.clinicalNote.create({
           data: {
             sessionId,
-            content: JSON.stringify(soapNote),
+            patientId: patient.id,
+            content: JSON.stringify(document),
           },
         });
 
-        io.to(userId).emit('uiStateChange', { type: 'noteGenerated', note });
+        io.to(userId).emit('uiStateChange', { type: 'documentGenerated', note, patient });
       } catch (err) {
-        io.to(userId).emit('transcriptError', 'Failed to generate clinical note.');
+        io.to(userId).emit('transcriptError', 'Failed to generate clinical document.');
       }
     };
 
@@ -123,7 +175,10 @@ export function setupSockets(io: Server): void {
       },
     );
 
-    socket.on('audioStop', (payload) => stopSpeech(payload));
+    socket.on('audioStop', (payload: AudioStopPayload) => finalizeTranscript(payload));
+
+    // --- AI document generation (patient/template selected client-side) ---
+    socket.on('generateDocument', (payload: GenerateDocumentPayload) => generateDocument(payload));
 
     // --- Cross-device UI state sync -------------------------------------
     socket.on('uiStateChange', (state: unknown) => {
@@ -135,7 +190,7 @@ export function setupSockets(io: Server): void {
     socket.on('disconnect', async (reason) => {
       // eslint-disable-next-line no-console
       console.log(`[socket] ${socket.id} disconnected (${reason})`);
-      await stopSpeech();
+      await finalizeTranscript();
     });
   });
 }

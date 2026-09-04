@@ -1,42 +1,33 @@
-# Phase 3 Technical Blueprint: Frontend Scaffold & Sync
+# Phase 4 Technical Blueprint: UI Upgrades, Decoupled AI, and Patient Assignment
 
 ## Objective
-Scaffold the Expo (React Native) frontend application, configure NativeWind for styling, and implement the core components for streaming audio via WebSockets and uploading images.
+Update the architecture to decouple transcription from AI generation, introduce a `Patient` schema for data assignment, implement a `.env.template` to prevent API key loss during git clones, and add platform-specific UI enhancements (web drag-and-drop & free text).
 
 ## Steps
 
-### 1. Scaffold the Expo Frontend
-- **Initialize Expo**: In the `actus-md-workspace` directory, create a new Expo project named `frontend` using the default template.
-  - Command: `npx create-expo-app frontend` (or equivalent non-interactive script).
-- **Dependencies**: 
-  - Navigate to `./frontend/` and install `socket.io-client`, `axios`, and audio recording dependencies (e.g., `expo-av` or `react-native-audio-record` if raw PCM extraction is needed).
-  - Install and configure **NativeWind** (Tailwind CSS for React Native) following its official Expo setup guide.
+### 1. Database Schema & Secrets Management
+- **Environment**: Configure the backend `server.ts` (or equivalent entrypoint) to load secrets from `azure_stt_openai.env` using `dotenv`. Create `backend/azure_stt_openai.env.template` containing the required Azure environment variables (empty values) so git tracks the schema.
+- **Prisma Schema**: Update `backend/prisma/schema.prisma` to include a `Patient` model.
+  - `Patient` should have `id` (String, uuid), `patientIdentifier` (String), and `createdAt` (DateTime).
+  - Update `ClinicalNote` (or `Session`) to relate to `Patient`.
+- **Database Push**: Run `npx prisma db push` in the backend directory.
 
-### 2. Implement Socket.io Client
-- **Configuration**: Create a utility module (e.g., `src/lib/socket.ts`) to initialize and export the `socket.io-client` connection.
-- **Connection Details**: Ensure the client connects to the backend running on port 3000 (or `process.env.EXPO_PUBLIC_API_URL`).
-- **Auth/Query**: Ensure the connection payload provides a `userId` during handshake (e.g., a hardcoded or randomly generated dummy user ID for local pilot testing).
+### 2. Backend Socket & AI Refactor
+- **Decouple Generation (`socketManager.ts`)**: 
+  - Modify `audioStop` so it only finalizes the transcription and emits `transcriptFinalized`. Remove the `generateSoapNote` call here.
+  - Add a new socket listener `generateDocument` that receives `{ transcript, images, freeText, templateType, patientIdentifier }`.
+- **AI Service (`azureOpenAI.ts`)**:
+  - Rename `generateSoapNote` to `generateMedicalDocument`.
+  - Accept `templateType` ("SOAP Note" or "Clinic Note") and swap the `SYSTEM_PROMPT` dynamically based on the requested template.
+  - The `generateDocument` socket listener should call this, save the output linking the `Patient`, and emit `uiStateChange`.
 
-### 3. Build `AudioDictation.tsx` Component
-- **Location**: `src/components/AudioDictation.tsx`.
-- **Functionality**:
-  - Implement a UI with a "Start Recording" / "Stop Recording" button styled with NativeWind.
-  - When recording starts, capture raw microphone audio at **16kHz / 16-bit / mono PCM** format.
-  - Stream chunks of this raw audio to the backend via the `audioChunk` Socket.io event.
-  - When stopped, emit the `audioStop` event (optionally sending `patientContext` or `sessionId`).
-  - Listen for `transcriptUpdate` socket events to display real-time transcription feedback to the user.
-
-### 4. Build `WebUpload.tsx` Component
-- **Location**: `src/components/WebUpload.tsx`.
-- **Functionality**:
-  - Implement an image selection UI (using `expo-image-picker`).
-  - Upon selection, upload the image file via HTTP POST to the backend's `/api/upload` endpoint using `axios` or `fetch`.
-  - Handle success/failure states and display the uploaded image preview using NativeWind styling.
-
-### 5. Application Assembly & Sync
-- **Main Screen**: Assemble `AudioDictation` and `WebUpload` into the main `app/index.tsx` (or `App.tsx` depending on routing).
-- **Global Sync**: Add a listener for `uiStateChange` socket events to react to generated SOAP notes pushed from the backend, displaying the final note in the UI when received.
-
-### 6. Verification & Commit
-- Run `npx tsc --noEmit` in `./frontend/` to ensure no TypeScript errors.
-- Stage and commit Phase 3 changes to the current feature branch.
+### 3. Frontend Platform-Specific Enhancements
+- **Web UI (`WebUpload.tsx`)**:
+  - Add drag-and-drop capabilities for web image uploads.
+  - Add a `<TextInput multiline={true} />` for free-text input.
+  - *Note*: Use React Native's `Platform.OS === 'web'` to conditionally render these web-only features.
+- **Patient Assignment UI**:
+  - Add a text input to capture a `Patient Identifier` (e.g., MRN or Name).
+- **Generation Flow (`app/index.tsx`)**:
+  - Add a dropdown/picker to select `templateType` ("SOAP Note" or "Clinic Note").
+  - Add a "Generate Output" button that bundles the `transcript`, `patientIdentifier`, `templateType`, `images`, and `freeText`, emitting the `generateDocument` event to the backend.

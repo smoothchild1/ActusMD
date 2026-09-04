@@ -3,11 +3,11 @@ import { AzureOpenAI } from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
 
 /**
- * Azure OpenAI - multimodal (image + text) -> structured JSON SOAP note.
+ * Azure OpenAI - multimodal (image + text) -> structured JSON medical document.
  *
  * Uses the official `openai` package's `AzureOpenAI` client against an Azure
  * deployment. Keys and endpoint come from environment variables loaded by
- * dotenv in server.ts.
+ * `loadEnv.ts` (see `azure_stt_openai.env`) in server.ts.
  */
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT ?? '';
@@ -24,7 +24,7 @@ function getClient(): AzureOpenAI {
   if (!isOpenAIConfigured()) {
     throw new Error(
       'Azure OpenAI is not configured. Set AZURE_OPENAI_ENDPOINT, ' +
-        'AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME in .env.',
+        'AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME in azure_stt_openai.env.',
     );
   }
   if (!client) {
@@ -38,7 +38,7 @@ function getClient(): AzureOpenAI {
   return client;
 }
 
-export interface SoapImageInput {
+export interface DocumentImageInput {
   /** Path to an image file on disk (e.g. something saved by the upload route). */
   path?: string;
   /** OR an already-formed URL / data URL. */
@@ -47,37 +47,65 @@ export interface SoapImageInput {
   mimeType?: string;
 }
 
-export interface SoapNoteRequest {
+/** The output template a clinician can request. New types just need an entry in `TEMPLATE_PROMPTS`. */
+export type TemplateType = 'SOAP Note' | 'Clinic Note' | (string & {});
+
+export interface MedicalDocumentRequest {
   /** Ambient dictation transcript for the encounter. */
   transcript: string;
   /** Optional supporting images (paper notes, wounds, monitors, lab printouts). */
-  images?: SoapImageInput[];
+  images?: DocumentImageInput[];
   /** Optional free-text context (known history, reason for visit, etc.). */
   patientContext?: string;
+  /** Which output format/template to generate. */
+  templateType: TemplateType;
 }
 
-export interface SoapNote {
-  subjective: string;
-  objective: string;
-  assessment: string;
-  plan: string;
+export interface MedicalDocumentSection {
+  heading: string;
+  content: string;
+}
+
+interface GeneratedDocumentBody {
+  sections: MedicalDocumentSection[];
   icd10Suggestions?: Array<{ code: string; description: string }>;
   followUp?: string;
   redFlags?: string[];
   [key: string]: unknown;
 }
 
-const SYSTEM_PROMPT = `You are a clinical documentation assistant for a licensed clinician.
-Convert the ambient visit transcript and any attached images into a structured SOAP note.
-Respond with ONLY minified JSON matching this shape:
-{"subjective":string,"objective":string,"assessment":string,"plan":string,
+export interface MedicalDocument extends GeneratedDocumentBody {
+  templateType: TemplateType;
+}
+
+const JSON_SHAPE_RULES = `Respond with ONLY minified JSON matching this shape:
+{"sections":[{"heading":string,"content":string}, ...],
 "icd10Suggestions":[{"code":string,"description":string}],"followUp":string,"redFlags":[string]}
 Rules:
-- Do not invent findings that are not supported by the transcript or images.
+- Do not invent findings that are not supported by the transcript, images, or provided context.
 - Use "Not documented" for any section with no supporting information.
 - Keep clinical language concise and professional.`;
 
-async function toImagePart(img: SoapImageInput): Promise<ChatCompletionContentPart> {
+/** System prompt per template type. Each defines the section headings the model must produce. */
+const TEMPLATE_PROMPTS: Record<string, string> = {
+  'SOAP Note': `You are a clinical documentation assistant for a licensed clinician.
+Convert the ambient visit transcript and any attached images into a structured SOAP note with
+exactly these sections, in order: "Subjective", "Objective", "Assessment", "Plan".
+${JSON_SHAPE_RULES}`,
+  'Clinic Note': `You are a clinical documentation assistant for a licensed clinician.
+Convert the ambient visit transcript and any attached images into a structured outpatient clinic
+note with exactly these sections, in order: "Chief Complaint", "History of Present Illness",
+"Exam & Findings", "Assessment & Plan".
+${JSON_SHAPE_RULES}`,
+};
+
+const DEFAULT_TEMPLATE: TemplateType = 'SOAP Note';
+
+function getSystemPrompt(templateType: TemplateType): string {
+  return TEMPLATE_PROMPTS[templateType] ?? TEMPLATE_PROMPTS[DEFAULT_TEMPLATE];
+}
+
+async function toImagePart(img: DocumentImageInput): Promise<ChatCompletionContentPart> {
   if (img.url) {
     return { type: 'image_url', image_url: { url: img.url } };
   }
@@ -93,11 +121,12 @@ async function toImagePart(img: SoapImageInput): Promise<ChatCompletionContentPa
 }
 
 /**
- * Send the multimodal payload to Azure OpenAI and parse the JSON SOAP note.
+ * Send the multimodal payload to Azure OpenAI and parse the JSON medical document,
+ * using the system prompt for the requested `templateType`.
  */
-export async function generateSoapNote(
-  req: SoapNoteRequest,
-): Promise<SoapNote> {
+export async function generateMedicalDocument(
+  req: MedicalDocumentRequest,
+): Promise<MedicalDocument> {
   const oai = getClient();
 
   const userContent: ChatCompletionContentPart[] = [
@@ -116,7 +145,7 @@ export async function generateSoapNote(
   }
 
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: getSystemPrompt(req.templateType) },
     { role: 'user', content: userContent },
   ];
 
@@ -130,10 +159,11 @@ export async function generateSoapNote(
     });
 
     const raw = result.choices[0]?.message?.content ?? '';
-    return JSON.parse(raw) as SoapNote;
+    const parsed = JSON.parse(raw) as GeneratedDocumentBody;
+    return { ...parsed, templateType: req.templateType };
   } catch (err: unknown) {
     throw new Error('Azure OpenAI returned content that was not valid JSON or API request failed.');
   }
 }
 
-export default generateSoapNote;
+export default generateMedicalDocument;
