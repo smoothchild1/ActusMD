@@ -59,14 +59,19 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
     function onTranscriptFinalized(payload: TranscriptFinalized) {
       onTranscriptFinalizedRef.current?.(payload?.transcript ?? '');
     }
+    function onConnectError(err: Error) {
+      setError(`Cannot reach the server (${err.message}). Recording will not be transcribed.`);
+    }
 
     socket.on('transcriptUpdate', onTranscriptUpdate);
     socket.on('transcriptError', onTranscriptError);
     socket.on('transcriptFinalized', onTranscriptFinalized);
+    socket.on('connect_error', onConnectError);
     return () => {
       socket.off('transcriptUpdate', onTranscriptUpdate);
       socket.off('transcriptError', onTranscriptError);
       socket.off('transcriptFinalized', onTranscriptFinalized);
+      socket.off('connect_error', onConnectError);
     };
   }, []);
 

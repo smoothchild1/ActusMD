@@ -65,18 +65,26 @@ export function createSpeechStream(
   const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
 
   recognizer.recognizing = (_s, e) => {
+    // eslint-disable-next-line no-console
+    console.log(`[azureSpeech] recognizing (reason=${sdk.ResultReason[e.result.reason]}): "${e.result.text}"`);
     if (e.result.reason === sdk.ResultReason.RecognizingSpeech && e.result.text) {
       handlers.onPartial?.(e.result.text);
     }
   };
 
   recognizer.recognized = (_s, e) => {
+    // eslint-disable-next-line no-console
+    console.log(`[azureSpeech] recognized (reason=${sdk.ResultReason[e.result.reason]}): "${e.result.text}"`);
     if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text) {
       handlers.onFinal?.(e.result.text);
     }
   };
 
   recognizer.canceled = (_s, e) => {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[azureSpeech] canceled: reason=${sdk.CancellationReason[e.reason]} errorCode=${e.errorCode} errorDetails=${e.errorDetails}`,
+    );
     if (e.reason === sdk.CancellationReason.Error) {
       handlers.onError?.(
         e.errorDetails || `Azure Speech canceled (code ${e.errorCode}).`,
@@ -85,11 +93,21 @@ export function createSpeechStream(
   };
 
   recognizer.sessionStopped = () => {
+    // eslint-disable-next-line no-console
+    console.log('[azureSpeech] sessionStopped');
     // Recognizer stopped on its own (e.g. stream closed); nothing to do.
   };
 
-  recognizer.startContinuousRecognitionAsync(undefined, (err) =>
-    handlers.onError?.(typeof err === 'string' ? err : String(err)),
+  recognizer.startContinuousRecognitionAsync(
+    () => {
+      // eslint-disable-next-line no-console
+      console.log('[azureSpeech] startContinuousRecognitionAsync succeeded');
+    },
+    (err) => {
+      // eslint-disable-next-line no-console
+      console.log(`[azureSpeech] startContinuousRecognitionAsync failed: ${err}`);
+      handlers.onError?.(typeof err === 'string' ? err : String(err));
+    },
   );
 
   return {

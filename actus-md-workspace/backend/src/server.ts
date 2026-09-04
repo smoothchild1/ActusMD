@@ -15,9 +15,7 @@ import { prisma } from './services/db';
  * the same HTTP server.
  */
 
-// The task brief says port 3000; the provided .env sets PORT=3001. We honor the
-// environment and fall back to 3000.
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 3001;
 
 const corsOrigin = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim())

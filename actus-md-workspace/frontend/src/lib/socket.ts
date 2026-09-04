@@ -12,7 +12,7 @@ import { io, type Socket } from 'socket.io-client';
 
 /** Base URL of the backend HTTP + WebSocket server. */
 export const API_URL =
-  process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000';
+  process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3001';
 
 /** Mock clinician id used for the local pilot handshake. */
 export const MOCK_USER_ID =

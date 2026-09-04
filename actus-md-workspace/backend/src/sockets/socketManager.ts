@@ -62,6 +62,7 @@ export function setupSockets(io: Server): void {
 
     let speech: SpeechStreamSession | null = null;
     let fullTranscript = '';
+    let chunkCounter = 0;
 
     const ensureSpeech = (): SpeechStreamSession | null => {
       if (speech) return speech;
@@ -165,6 +166,10 @@ export function setupSockets(io: Server): void {
     socket.on(
       'audioChunk',
       (chunk: ArrayBuffer | Buffer | Uint8Array) => {
+        chunkCounter += 1;
+        // eslint-disable-next-line no-console
+        if (chunkCounter % 20 === 0) console.log(`[socket] Received ${chunkCounter} audio chunks from ${socket.id}`);
+
         const session = ensureSpeech();
         if (!session) return;
         try {
