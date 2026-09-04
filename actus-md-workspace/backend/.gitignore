@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Local SQLite database
+prisma/*.db
+prisma/*.db-journal
+dev.db
+
+# Uploaded files (keep the folder, ignore contents)
+uploads/*
+!uploads/.gitkeep

@@ -1,0 +1,42 @@
+{
+  "name": "actus-md-backend",
+  "version": "1.0.0",
+  "description": "ActusMD local pilot backend - Express, Socket.io, Prisma/SQLite, Azure AI Speech + Azure OpenAI.",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@azure/openai": "1.0.0-beta.12",
+    "@prisma/client": "^6.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "microsoft-cognitiveservices-speech-sdk": "^1.42.0",
+    "multer": "^2.0.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.10.7",
+    "nodemon": "^3.1.9",
+    "prisma": "^6.3.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  },
+  "nodemonConfig": {
+    "watch": ["src"],
+    "ext": "ts,json",
+    "exec": "ts-node src/server.ts"
+  }
+}

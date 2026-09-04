@@ -1,0 +1,31 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id       String    @id @default(uuid())
+  email    String    @unique
+  name     String?
+  sessions Session[]
+}
+
+model Session {
+  id            String         @id @default(uuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id])
+  createdAt     DateTime       @default(now())
+  clinicalNotes ClinicalNote[]
+}
+
+model ClinicalNote {
+  id        String   @id @default(uuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id])
+  content   String // Structured JSON SOAP note
+  createdAt DateTime @default(now())
+}
