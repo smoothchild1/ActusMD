@@ -5,8 +5,9 @@ import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'open
 /**
  * Azure OpenAI - multimodal (image + text) -> structured JSON SOAP note.
  *
- * Uses the `@azure/openai` `OpenAIClient` against an Azure deployment. Keys and
- * endpoint come from environment variables loaded by dotenv in server.ts.
+ * Uses the official `openai` package's `AzureOpenAI` client against an Azure
+ * deployment. Keys and endpoint come from environment variables loaded by
+ * dotenv in server.ts.
  */
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT ?? '';
