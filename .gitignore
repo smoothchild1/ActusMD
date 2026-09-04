@@ -1,1 +1,4 @@
 azure_stt_openai.env
+
+# macOS
+.DS_Store
