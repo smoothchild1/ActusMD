@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
-import { OpenAIClient, AzureKeyCredential } from '@azure/openai';
+import { AzureOpenAI } from 'openai';
+import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
 
 /**
  * Azure OpenAI - multimodal (image + text) -> structured JSON SOAP note.
@@ -17,8 +18,8 @@ export function isOpenAIConfigured(): boolean {
   return Boolean(ENDPOINT && API_KEY && DEPLOYMENT);
 }
 
-let client: OpenAIClient | null = null;
-function getClient(): OpenAIClient {
+let client: AzureOpenAI | null = null;
+function getClient(): AzureOpenAI {
   if (!isOpenAIConfigured()) {
     throw new Error(
       'Azure OpenAI is not configured. Set AZURE_OPENAI_ENDPOINT, ' +
@@ -26,8 +27,11 @@ function getClient(): OpenAIClient {
     );
   }
   if (!client) {
-    client = new OpenAIClient(ENDPOINT, new AzureKeyCredential(API_KEY), {
+    client = new AzureOpenAI({
+      endpoint: ENDPOINT,
+      apiKey: API_KEY,
       apiVersion: API_VERSION,
+      deployment: DEPLOYMENT,
     });
   }
   return client;
@@ -72,16 +76,16 @@ Rules:
 - Use "Not documented" for any section with no supporting information.
 - Keep clinical language concise and professional.`;
 
-async function toImagePart(img: SoapImageInput) {
+async function toImagePart(img: SoapImageInput): Promise<ChatCompletionContentPart> {
   if (img.url) {
-    return { type: 'image_url' as const, imageUrl: { url: img.url } };
+    return { type: 'image_url', image_url: { url: img.url } };
   }
   if (img.path) {
     const buf = await fs.readFile(img.path);
     const mime = img.mimeType ?? 'image/jpeg';
     return {
-      type: 'image_url' as const,
-      imageUrl: { url: `data:${mime};base64,${buf.toString('base64')}` },
+      type: 'image_url',
+      image_url: { url: `data:${mime};base64,${buf.toString('base64')}` },
     };
   }
   throw new Error('Image input requires either "path" or "url".');
@@ -95,7 +99,7 @@ export async function generateSoapNote(
 ): Promise<SoapNote> {
   const oai = getClient();
 
-  const userContent: unknown[] = [
+  const userContent: ChatCompletionContentPart[] = [
     {
       type: 'text',
       text:
@@ -110,29 +114,24 @@ export async function generateSoapNote(
     userContent.push(await toImagePart(img));
   }
 
-  const messages = [
+  const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: userContent },
   ];
 
-  const result = await oai.getChatCompletions(
-    DEPLOYMENT,
-    // The beta typings do not model multimodal content parts; cast is expected.
-    messages as never,
-    {
-      temperature: 0.2,
-      maxTokens: 1500,
-      responseFormat: { type: 'json_object' },
-    },
-  );
-
-  const raw = result.choices[0]?.message?.content ?? '';
   try {
+    const result = await oai.chat.completions.create({
+      model: DEPLOYMENT,
+      messages: messages,
+      temperature: 0.2,
+      max_tokens: 1500,
+      response_format: { type: 'json_object' },
+    });
+
+    const raw = result.choices[0]?.message?.content ?? '';
     return JSON.parse(raw) as SoapNote;
-  } catch {
-    throw new Error(
-      `Azure OpenAI returned content that was not valid JSON: ${raw.slice(0, 500)}`,
-    );
+  } catch (err: unknown) {
+    throw new Error('Azure OpenAI returned content that was not valid JSON or API request failed.');
   }
 }
 

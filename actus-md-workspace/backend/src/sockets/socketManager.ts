@@ -4,6 +4,8 @@ import {
   isSpeechConfigured,
   type SpeechStreamSession,
 } from '../services/azureSpeech';
+import { prisma } from '../services/db';
+import { generateSoapNote } from '../services/azureOpenAI';
 
 /**
  * Socket.io wiring for ActusMD.
@@ -41,6 +43,7 @@ export function setupSockets(io: Server): void {
     console.log(`[socket] ${socket.id} joined room "${userId}"`);
 
     let speech: SpeechStreamSession | null = null;
+    let fullTranscript = '';
 
     const ensureSpeech = (): SpeechStreamSession | null => {
       if (speech) return speech;
@@ -51,18 +54,59 @@ export function setupSockets(io: Server): void {
       speech = createSpeechStream({
         onPartial: (text) =>
           io.to(userId).emit('transcriptUpdate', { text, final: false }),
-        onFinal: (text) =>
-          io.to(userId).emit('transcriptUpdate', { text, final: true }),
+        onFinal: (text) => {
+          fullTranscript += (fullTranscript ? ' ' : '') + text;
+          io.to(userId).emit('transcriptUpdate', { text, final: true });
+        },
         onError: (message) => io.to(userId).emit('transcriptError', message),
       });
       return speech;
     };
 
-    const stopSpeech = async () => {
+    const stopSpeech = async (payload?: { sessionId?: string, patientContext?: string, images?: any[] }) => {
       if (!speech) return;
-      const session = speech;
+      const sessionObj = speech;
       speech = null;
-      await session.stop().catch(() => undefined);
+      await sessionObj.stop().catch(() => undefined);
+
+      const transcript = fullTranscript.trim();
+      fullTranscript = '';
+
+      if (!transcript && !(payload?.images?.length)) {
+        return;
+      }
+
+      try {
+        const soapNote = await generateSoapNote({
+          transcript,
+          patientContext: payload?.patientContext,
+          images: payload?.images,
+        });
+
+        let sessionId = payload?.sessionId;
+        if (!sessionId) {
+          await prisma.user.upsert({
+            where: { id: userId },
+            update: {},
+            create: { id: userId, email: `${userId}@dummy.local` },
+          });
+          const newSession = await prisma.session.create({
+            data: { userId },
+          });
+          sessionId = newSession.id;
+        }
+
+        const note = await prisma.clinicalNote.create({
+          data: {
+            sessionId,
+            content: JSON.stringify(soapNote),
+          },
+        });
+
+        io.to(userId).emit('uiStateChange', { type: 'noteGenerated', note });
+      } catch (err) {
+        io.to(userId).emit('transcriptError', 'Failed to generate clinical note.');
+      }
     };
 
     // --- Ambient dictation -------------------------------------------------
@@ -79,7 +123,7 @@ export function setupSockets(io: Server): void {
       },
     );
 
-    socket.on('audioStop', stopSpeech);
+    socket.on('audioStop', (payload) => stopSpeech(payload));
 
     // --- Cross-device UI state sync -------------------------------------
     socket.on('uiStateChange', (state: unknown) => {
