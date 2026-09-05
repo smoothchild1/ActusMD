@@ -101,7 +101,7 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        <AudioDictation onTranscriptFinalized={setTranscript} />
+        <AudioDictation onTranscriptChange={setTranscript} />
         <WebUpload onImagesChange={setImages} onFreeTextChange={setFreeText} />
 
         <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">

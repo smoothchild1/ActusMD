@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, TextInput, View } from 'react-native';
 
 import { pcmRecorder } from '@/lib/pcmRecorder';
 import { connectSocket, socket } from '@/lib/socket';
@@ -10,11 +10,12 @@ import { connectSocket, socket } from '@/lib/socket';
  *  - Captures raw 16 kHz / 16-bit / mono PCM via {@link pcmRecorder}.
  *  - Streams each chunk to the backend as a binary `audioChunk` socket event.
  *  - Emits `audioStop` when the clinician stops; the backend only finalizes
- *    the transcript at that point (no AI call) and replies with
- *    `transcriptFinalized`, which is handed to the parent via
- *    `onTranscriptFinalized` so it can be bundled into a later
- *    `generateDocument` request.
- *  - Renders `transcriptUpdate` events (partial + finalized) as live feedback.
+ *    the transcript at that point (no AI call).
+ *  - Renders `transcriptUpdate` events (partial + final) as an editable
+ *    `TextInput` so the clinician can correct the transcript live or after
+ *    stopping. `onTranscriptChange` keeps the parent's transcript state in
+ *    sync with whatever is currently in the box (streamed text or manual
+ *    edits), so it reflects exactly what will be sent to `generateDocument`.
  */
 
 interface TranscriptUpdate {
@@ -27,11 +28,11 @@ interface TranscriptFinalized {
 }
 
 interface AudioDictationProps {
-  /** Called with the authoritative transcript once the backend finalizes it. */
-  onTranscriptFinalized?: (transcript: string) => void;
+  /** Called with the current transcript text every time it changes. */
+  onTranscriptChange?: (transcript: string) => void;
 }
 
-export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
+export function AudioDictation({ onTranscriptChange }: AudioDictationProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,15 +42,22 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
 
   // Kept in a ref so the socket listener effect below doesn't need to
   // re-subscribe every time the parent passes a new callback identity.
-  const onTranscriptFinalizedRef = useRef(onTranscriptFinalized);
-  onTranscriptFinalizedRef.current = onTranscriptFinalized;
+  const onTranscriptChangeRef = useRef(onTranscriptChange);
+  onTranscriptChangeRef.current = onTranscriptChange;
 
   useEffect(() => {
     function onTranscriptUpdate(update: TranscriptUpdate) {
       if (update?.final) {
-        setFinalText((prev) => (prev ? `${prev} ${update.text}` : update.text));
+        // Functional update so this merges onto whatever is currently in the
+        // box - including any manual edits the clinician has already made -
+        // rather than a stale `finalText` closed over when the listener was
+        // registered.
+        setFinalText((prev) => prev ? `${prev} ${update.text}` : update.text);
         setPartialText('');
       } else {
+        // Partial (non-final) text is only ever shown separately below the
+        // input, never written into `finalText`, so it can never clobber a
+        // manual edit in progress.
         setPartialText(update?.text ?? '');
       }
     }
@@ -57,7 +65,18 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
       setError(typeof message === 'string' ? message : 'Transcription error.');
     }
     function onTranscriptFinalized(payload: TranscriptFinalized) {
-      onTranscriptFinalizedRef.current?.(payload?.transcript ?? '');
+      // The server rebuilds this transcript from the same final chunks
+      // already streamed and merged into `finalText` above, so it would
+      // normally just repeat what's already in the box. Only fall back to it
+      // when the box is still empty (e.g. a `transcriptUpdate` was missed) -
+      // otherwise this would silently overwrite any manual edits the
+      // clinician made during or after recording.
+      setFinalText((prev) => {
+        if (prev.trim()) return prev;
+        const fallback = payload?.transcript ?? '';
+        onTranscriptChangeRef.current?.(fallback);
+        return fallback;
+      });
     }
     function onConnectError(err: Error) {
       setError(`Cannot reach the server (${err.message}). Recording will not be transcribed.`);
@@ -75,10 +94,19 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
     };
   }, []);
 
+  useEffect(() => {
+    onTranscriptChangeRef.current?.(finalText);
+  }, [finalText]);
+
+  const handleFinalTextChange = useCallback((text: string) => {
+    setFinalText(text);
+  }, []);
+
   const handleStart = useCallback(async () => {
     setError(null);
     setFinalText('');
     setPartialText('');
+    onTranscriptChangeRef.current?.('');
     chunkCount.current = 0;
 
     if (!pcmRecorder.isSupported) {
@@ -114,8 +142,6 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
     }
   }, []);
 
-  const hasTranscript = Boolean(finalText || partialText);
-
   return (
     <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
       <View className="flex-row items-center justify-between">
@@ -141,18 +167,19 @@ export function AudioDictation({ onTranscriptFinalized }: AudioDictationProps) {
 
       <View className="gap-1">
         <Text className="text-xs uppercase tracking-wide text-slate-400">Live transcript</Text>
-        <ScrollView className="max-h-40 rounded-lg bg-black/30 p-3">
-          {hasTranscript ? (
-            <Text className="text-sm text-slate-100">
-              {finalText}
-              {partialText ? <Text className="text-slate-400">{` ${partialText}`}</Text> : null}
-            </Text>
-          ) : (
-            <Text className="text-sm text-slate-500">
-              Transcription will appear here as you speak…
-            </Text>
-          )}
-        </ScrollView>
+        <TextInput
+          multiline
+          scrollEnabled
+          textAlignVertical="top"
+          value={finalText}
+          onChangeText={handleFinalTextChange}
+          placeholder="Transcription will appear here as you speak… you can edit it at any time."
+          placeholderTextColor="#64748b"
+          className="max-h-40 min-h-24 rounded-lg bg-black/30 p-3 text-sm text-slate-100"
+        />
+        {partialText ? (
+          <Text className="text-xs italic text-slate-400">{`Listening… ${partialText}`}</Text>
+        ) : null}
       </View>
     </View>
   );

@@ -6,6 +6,7 @@ import {
 } from '../services/azureSpeech';
 import { prisma } from '../services/db';
 import { generateMedicalDocument, type DocumentImageInput, type TemplateType } from '../services/azureOpenAI';
+import { writeAuditLog } from '../middleware/auditMiddleware';
 
 /**
  * Socket.io wiring for ActusMD.
@@ -122,17 +123,28 @@ export function setupSockets(io: Server): void {
       }
 
       try {
+        const patient = await prisma.patient.upsert({
+          where: { patientIdentifier },
+          update: {},
+          create: { patientIdentifier },
+        });
+
+        // generateMedicalDocument reads the patient's Living Profile + recent
+        // Artifacts (Step 5 context injection) before calling the LLM - log
+        // that PHI read here, at the request boundary where we know `userId`.
+        void writeAuditLog({
+          userId,
+          action: 'READ',
+          resource: 'PatientContext',
+          patientId: patient.id,
+        });
+
         const document = await generateMedicalDocument({
           transcript,
           patientContext: freeText,
           images: payload?.images,
           templateType,
-        });
-
-        const patient = await prisma.patient.upsert({
-          where: { patientIdentifier },
-          update: {},
-          create: { patientIdentifier },
+          patientId: patient.id,
         });
 
         let sessionId = payload?.sessionId;
@@ -156,8 +168,17 @@ export function setupSockets(io: Server): void {
           },
         });
 
+        void writeAuditLog({
+          userId,
+          action: 'CREATE',
+          resource: 'ClinicalNote',
+          patientId: patient.id,
+          metadata: { clinicalNoteId: note.id, templateType },
+        });
+
         io.to(userId).emit('uiStateChange', { type: 'documentGenerated', note, patient });
       } catch (err) {
+        console.error('[socket] generateDocument failed:', err);
         io.to(userId).emit('transcriptError', 'Failed to generate clinical document.');
       }
     };

@@ -3,11 +3,13 @@ import type { PcmChunkHandler, PcmRecorder } from './pcmRecorder';
 /**
  * Web raw-PCM recorder (Expo web build).
  *
- * `getUserMedia` + a Web Audio graph captures Float32 samples at the browser's
- * native rate; each block is downsampled to 16 kHz, converted to signed 16-bit
- * little-endian PCM, and handed to the caller as an `ArrayBuffer`. That matches
- * the backend's Azure Speech push-stream format and is emitted verbatim over
- * Socket.io as an `audioChunk`.
+ * `getUserMedia` + a Web Audio graph captures Float32 samples. The
+ * `AudioContext` is requested directly at 16 kHz, so the browser's native
+ * (anti-aliased) resampler produces the target rate instead of a manual
+ * decimation loop. Each block is converted to signed 16-bit little-endian
+ * PCM and handed to the caller as an `ArrayBuffer`, matching the backend's
+ * Azure Speech push-stream format, and is emitted verbatim over Socket.io
+ * as an `audioChunk`.
  */
 
 export type { PcmChunkHandler, PcmRecorder } from './pcmRecorder';
@@ -19,29 +21,6 @@ let audioContext: AudioContext | null = null;
 let mediaStream: MediaStream | null = null;
 let sourceNode: MediaStreamAudioSourceNode | null = null;
 let processorNode: ScriptProcessorNode | null = null;
-
-/** Average-decimate `input` from `inputRate` down to `TARGET_SAMPLE_RATE`. */
-function downsample(input: Float32Array, inputRate: number): Float32Array {
-  if (inputRate <= TARGET_SAMPLE_RATE) return input;
-  const ratio = inputRate / TARGET_SAMPLE_RATE;
-  const outLength = Math.round(input.length / ratio);
-  const output = new Float32Array(outLength);
-  let outIndex = 0;
-  let inIndex = 0;
-  while (outIndex < outLength) {
-    const nextInIndex = Math.round((outIndex + 1) * ratio);
-    let sum = 0;
-    let count = 0;
-    for (let i = inIndex; i < nextInIndex && i < input.length; i += 1) {
-      sum += input[i];
-      count += 1;
-    }
-    output[outIndex] = count > 0 ? sum / count : 0;
-    outIndex += 1;
-    inIndex = nextInIndex;
-  }
-  return output;
-}
 
 /** Float [-1, 1] -> signed 16-bit little-endian PCM. */
 function floatTo16BitPcm(samples: Float32Array): ArrayBuffer {
@@ -66,22 +45,34 @@ export const pcmRecorder: PcmRecorder = {
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
+        sampleRate: TARGET_SAMPLE_RATE,
       },
     });
 
-    audioContext = new AudioContext();
+    // Requesting the context at 16 kHz directly makes the browser's own
+    // (anti-aliased) sample-rate converter produce the target rate, instead
+    // of resampling with a manual decimation loop after the fact.
+    audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
     // Some browsers start the context suspended until a user gesture resumes it.
     if (audioContext.state === 'suspended') {
       await audioContext.resume();
     }
 
+    if (audioContext.sampleRate !== TARGET_SAMPLE_RATE) {
+      // A browser that ignores the requested rate would otherwise silently
+      // hand Azure Speech audio sampled at the wrong rate.
+      throw new Error(
+        `AudioContext ignored the requested ${TARGET_SAMPLE_RATE}Hz sample rate ` +
+          `(got ${audioContext.sampleRate}Hz); this browser is not supported.`
+      );
+    }
+
     sourceNode = audioContext.createMediaStreamSource(mediaStream);
     processorNode = audioContext.createScriptProcessor(FRAME_SIZE, 1, 1);
 
-    const inputRate = audioContext.sampleRate;
     processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
       const channel = event.inputBuffer.getChannelData(0);
-      onChunk(floatTo16BitPcm(downsample(channel, inputRate)));
+      onChunk(floatTo16BitPcm(channel));
     };
 
     sourceNode.connect(processorNode);

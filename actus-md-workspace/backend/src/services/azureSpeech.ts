@@ -57,6 +57,7 @@ export function createSpeechStream(
   const speechConfig = sdk.SpeechConfig.fromSubscription(SPEECH_KEY, SPEECH_REGION);
   speechConfig.speechRecognitionLanguage = SPEECH_LANGUAGE;
   speechConfig.outputFormat = sdk.OutputFormat.Simple;
+  speechConfig.enableDictation();
 
   const pushStream = sdk.AudioInputStream.createPushStream(
     sdk.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1),

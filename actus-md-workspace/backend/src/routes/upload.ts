@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import multer from 'multer';
+import { auditPHIAccess } from '../middleware/auditMiddleware';
 
 /**
  * Image upload router.
@@ -51,28 +52,38 @@ const upload = multer({
 
 const router = Router();
 
-router.post('/', upload.array('images', 10), (req: Request, res: Response) => {
-  const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+router.post(
+  '/',
+  upload.array('images', 10),
+  auditPHIAccess({
+    action: 'CREATE',
+    resource: 'UploadedImage',
+    // Uploads happen before a patient is selected client-side (see
+    // socketManager's generateDocument flow), so no patientId is known yet.
+  }),
+  (req: Request, res: Response) => {
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
 
-  if (files.length === 0) {
-    return res
-      .status(400)
-      .json({ error: 'No image files received. Use multipart field name "images".' });
-  }
+    if (files.length === 0) {
+      return res
+        .status(400)
+        .json({ error: 'No image files received. Use multipart field name "images".' });
+    }
 
-  res.status(201).json({
-    count: files.length,
-    files: files.map((f) => ({
-      id: path.parse(f.filename).name,
-      filename: f.filename,
-      originalName: f.originalname,
-      mimeType: f.mimetype,
-      size: f.size,
-      url: `/uploads/${f.filename}`,
-      storedPath: f.path,
-    })),
-  });
-});
+    res.status(201).json({
+      count: files.length,
+      files: files.map((f) => ({
+        id: path.parse(f.filename).name,
+        filename: f.filename,
+        originalName: f.originalname,
+        mimeType: f.mimetype,
+        size: f.size,
+        url: `/uploads/${f.filename}`,
+        storedPath: f.path,
+      })),
+    });
+  },
+);
 
 // Translate multer / filter errors into JSON responses.
 router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

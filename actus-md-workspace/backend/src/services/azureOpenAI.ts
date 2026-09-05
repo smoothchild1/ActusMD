@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import { AzureOpenAI } from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
+import { buildPatientContextBlock } from './patientContext';
 
 /**
  * Azure OpenAI - multimodal (image + text) -> structured JSON medical document.
@@ -20,7 +21,9 @@ export function isOpenAIConfigured(): boolean {
 }
 
 let client: AzureOpenAI | null = null;
-function getClient(): AzureOpenAI {
+
+/** Shared Azure OpenAI client, reused by any service that needs chat completions. */
+export function getOpenAIClient(): AzureOpenAI {
   if (!isOpenAIConfigured()) {
     throw new Error(
       'Azure OpenAI is not configured. Set AZURE_OPENAI_ENDPOINT, ' +
@@ -37,6 +40,9 @@ function getClient(): AzureOpenAI {
   }
   return client;
 }
+
+/** Deployment name for the shared client, needed as the `model` param on each call. */
+export const OPENAI_DEPLOYMENT = DEPLOYMENT;
 
 export interface DocumentImageInput {
   /** Path to an image file on disk (e.g. something saved by the upload route). */
@@ -59,6 +65,12 @@ export interface MedicalDocumentRequest {
   patientContext?: string;
   /** Which output format/template to generate. */
   templateType: TemplateType;
+  /**
+   * If provided, the patient's Living Profile and recent Artifacts are
+   * fetched from Postgres and injected into the system prompt, giving the
+   * model longitudinal context beyond this single encounter.
+   */
+  patientId?: string;
 }
 
 export interface MedicalDocumentSection {
@@ -122,12 +134,14 @@ async function toImagePart(img: DocumentImageInput): Promise<ChatCompletionConte
 
 /**
  * Send the multimodal payload to Azure OpenAI and parse the JSON medical document,
- * using the system prompt for the requested `templateType`.
+ * using the system prompt for the requested `templateType`. When `req.patientId`
+ * is set, the patient's Living Profile + recent Artifacts are fetched from
+ * Postgres and appended to the system prompt for longitudinal context.
  */
 export async function generateMedicalDocument(
   req: MedicalDocumentRequest,
 ): Promise<MedicalDocument> {
-  const oai = getClient();
+  const oai = getOpenAIClient();
 
   const userContent: ChatCompletionContentPart[] = [
     {
@@ -144,8 +158,13 @@ export async function generateMedicalDocument(
     userContent.push(await toImagePart(img));
   }
 
+  const patientContextBlock = req.patientId ? await buildPatientContextBlock(req.patientId) : '';
+  const systemPrompt = patientContextBlock
+    ? `${getSystemPrompt(req.templateType)}\n\n${patientContextBlock}`
+    : getSystemPrompt(req.templateType);
+
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: getSystemPrompt(req.templateType) },
+    { role: 'system', content: systemPrompt },
     { role: 'user', content: userContent },
   ];
 
@@ -154,15 +173,18 @@ export async function generateMedicalDocument(
       model: DEPLOYMENT,
       messages: messages,
       temperature: 0.2,
-      max_tokens: 1500,
+      max_completion_tokens: 1500,
       response_format: { type: 'json_object' },
     });
 
     const raw = result.choices[0]?.message?.content ?? '';
-    const parsed = JSON.parse(raw) as GeneratedDocumentBody;
+    const rawCleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(rawCleaned) as GeneratedDocumentBody;
     return { ...parsed, templateType: req.templateType };
-  } catch (err: unknown) {
-    throw new Error('Azure OpenAI returned content that was not valid JSON or API request failed.');
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.error('[azureOpenAI] generateMedicalDocument failed:', err?.message || err);
+    throw new Error(`Azure OpenAI Error: ${err?.message || String(err)}`);
   }
 }
 

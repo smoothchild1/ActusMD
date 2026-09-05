@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -33,8 +33,81 @@ model ClinicalNote {
 }
 
 model Patient {
-  id                String         @id @default(uuid())
-  patientIdentifier String         @unique
-  createdAt         DateTime       @default(now())
+  id                String          @id @default(uuid())
+  patientIdentifier String          @unique
+  createdAt         DateTime        @default(now())
   clinicalNotes     ClinicalNote[]
+  artifacts         Artifact[]
+  profile           PatientProfile?
+}
+
+/// Tier 1: Immutable Artifact Store. Append-only record of raw clinical
+/// inputs (dictated audio, clinician free-text, scanned charts). Corrections
+/// must be appended as new addenda (via `addendumForId`) rather than
+/// mutating or deleting existing rows - enforced at the service layer.
+enum ArtifactType {
+  AUDIO_DICTATION
+  FREE_TEXT
+  SCANNED_CHART
+}
+
+model Artifact {
+  id        String       @id @default(uuid())
+  patientId String
+  patient   Patient      @relation(fields: [patientId], references: [id])
+  type      ArtifactType
+
+  /// Pointer to the raw file in Azure Blob Storage / Azurite (audio, scanned
+  /// image, etc). Null for pure free-text artifacts with no binary payload.
+  blobUrl String?
+
+  /// Transcript / OCR output / clinician free-text. Contains PHI.
+  rawText String? /// @encrypted
+
+  /// If this artifact is a correction/addendum, points at the artifact it
+  /// amends. The original row is never overwritten or deleted.
+  addendumForId String?
+  addendumFor   Artifact?  @relation("ArtifactAddenda", fields: [addendumForId], references: [id])
+  addenda       Artifact[] @relation("ArtifactAddenda")
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  @@index([patientId, createdAt])
+}
+
+/// Tier 2: Living Patient Profile. AI-synthesized context (active problems,
+/// surgical history, recent baselines, etc.) kept up to date whenever a new
+/// Artifact is ingested. One row per patient.
+model PatientProfile {
+  id        String  @id @default(uuid())
+  patientId String  @unique
+  patient   Patient @relation(fields: [patientId], references: [id])
+
+  /// JSON-serialized synthesized profile. Stored as encrypted text rather
+  /// than native jsonb: prisma-field-encryption only supports String
+  /// columns, so this is the tradeoff for field-level PHI encryption.
+  synthesizedData String /// @encrypted
+
+  /// Last Artifact incorporated into the synthesis, so the background
+  /// process can synthesize incrementally instead of replaying history.
+  lastArtifactId String?
+
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+/// Strict audit trail for every read/write access to PHI, per HIPAA.
+/// Written by `auditMiddleware` - never updated or deleted.
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  action    String
+  resource  String
+  patientId String?
+  metadata  String?
+  timestamp DateTime @default(now())
+
+  @@index([patientId, timestamp])
+  @@index([userId, timestamp])
 }

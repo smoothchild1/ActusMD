@@ -12,7 +12,7 @@
       "infoPlist": {
         "NSMicrophoneUsageDescription": "ActusMD uses the microphone to transcribe patient encounters."
       },
-      "bundleIdentifier": "com.anonymous.frontend"
+      "bundleIdentifier": "com.paulmarcet.actusmd"
     },
     "android": {
       "adaptiveIcon": {
