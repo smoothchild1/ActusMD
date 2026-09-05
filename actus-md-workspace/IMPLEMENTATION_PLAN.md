@@ -1,20 +1,25 @@
 # Implementation Plan & State Tracker
 
-- [x] **Phase 1 (Agent 1):** Workspace & Backend Setup (Node.js/Express scaffold, SQLite/Prisma schema, `fs` image upload middleware). Backend scaffolded at `actus-md-workspace/backend`; deps installed, Prisma client generated, `dev.db` created via `prisma db push`, `tsc --noEmit` passes. Server not started per instructions.
+## Current Objective
+- **Phase 6:** Data Storage & Retrieval Exploration + AI Output Expansion (Handling multimodal inputs/pictures and expanding generation capabilities).
+
+## Active Dependencies & Architecture
+- **Backend:** Node.js/Express, TypeScript, Prisma (SQLite), Socket.io, `azure-cognitiveservices-speech-sdk`, `openai`.
+- **Frontend:** Expo (React Native Web), NativeWind, Socket.io-client.
+- **Two-Tier Clinical Databank Architecture:**
+  1. **Tier 1 (Immutable Artifact Store):** Append-only raw inputs (audio, text, images).
+  2. **Tier 2 (Living Patient Profile):** Background synthesized JSONB in Postgres representing active problems, etc.
+  3. **Context Retrieval:** New encounters fetch the Living Profile and recent artifacts to inject into the LLM prompt.
+
+## Failed Approaches & Gotchas
+- **React Native Web State Loops:** Do not put `setState` in a render closure that depends on an incoming socket payload without a `useEffect` buffer, or it triggers an infinite re-render loop (Fixed in `AudioDictation.tsx`).
+- **Web Audio Quality:** The default `AudioContext` downsamples heavily in the browser. Always request `16000Hz` directly in the `getUserMedia` constraints (`pcmRecorder.web.ts`) for Azure STT.
+- **Azure OpenAI Markdown:** Azure OpenAI frequently wraps JSON objects in markdown (```json). Always regex strip this before `JSON.parse` (`azureOpenAI.ts`).
+- **OpenAI Token Limits:** Use `max_completion_tokens` instead of `max_tokens` for newer models like `gpt-4o-mini`.
+
+## Completed Milestones
+- [x] **Phase 1 (Agent 1):** Workspace & Backend Setup (Node.js/Express scaffold, SQLite/Prisma schema, `fs` image upload middleware).
 - [x] **Phase 2 (Agent 2):** WebSockets & AI Integration (Socket.io rooms, Azure AI Speech routing, Azure OpenAI multimodal handling).
 - [x] **Phase 3 (Agent 3):** Frontend Scaffold & Sync (Expo/React Native setup, NativeWind layout, Socket.io client, AudioDictation, WebUpload).
-- [x] **Phase 4 (Agent 4):** UI Upgrades, Decoupled AI, & Patient Assignment. `Patient` model added and pushed to SQLite; `azure_stt_openai.env` loaded explicitly via `loadEnv.ts`; `generateSoapNote` renamed to `generateMedicalDocument` with per-template prompts; `socketManager.ts` decoupled (`audioStop` -> `transcriptFinalized`, new `generateDocument` listener persists + emits `uiStateChange`); frontend adds patient identifier input, template picker, "Generate Output" flow, and web-only drag-and-drop/free-text in `WebUpload.tsx`. `tsc --noEmit` passes in both `backend/` and `frontend/`.
-- [x] **Phase 5 (Agent 5):** HIPAA-Compliant Context Retrieval and Data Storage Architecture (Two-Tier Clinical Databank).
-  - **System Rules: Two-Tier Clinical Databank Architecture**
-    - **1. Tier 1: The Immutable Artifact Store (Raw Input)**
-      - **Inputs:** Dictated audio, clinician free-text, and scanned patient charts (images/OCR).
-      - **Storage Rule:** Append-only databank. No overwrites/deletions. Corrections via appended addenda.
-      - **Backend:** Azure Blob Storage for raw files; Azure PostgreSQL for artifact metadata/content.
-    - **2. Tier 2: The Living Patient Profile (Synthesized Context)**
-      - **Behavior:** On new artifact, background AI process updates a "Living Profile".
-      - **Structure:** JSONB in Postgres representing structured active problems, surgical history, etc.
-    - **3. Context Retrieval (Streamlined Output)**
-      - **Behavior:** New encounter fetches Living Profile AND recent relevant artifacts.
-      - **Injection:** Fetched context automatically injected into LLM prompt for new clinical output.
-    - **4. HIPAA & Security Invariants**
-      - **Compliance:** Azure data storage must use field-level encryption for PHI and strict audit logging for all read/write actions.
+- [x] **Phase 4 (Agent 4):** UI Upgrades, Decoupled AI, & Patient Assignment. Added `Patient` model, decoupled `socketManager.ts`, added UI patient picker and WebUpload free-text support.
+- [x] **Phase 5 (Agent 5):** HIPAA-Compliant Context Retrieval and Data Storage Architecture (Two-Tier Clinical Databank integration + debugging STT/OpenAI connections).
