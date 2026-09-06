@@ -1,209 +1,506 @@
+import { Link, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+  View,
+  type ViewStyle,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { AudioDictation } from '@/components/AudioDictation';
-import { WebUpload } from '@/components/WebUpload';
-import { connectSocket, socket } from '@/lib/socket';
 import {
-  parseMedicalDocument,
-  type DocumentImageRef,
-  type MedicalDocument,
-  type UiStateChangeEvent,
-} from '@/lib/soap';
-
-/** Output templates the clinician can pick from. Must match `TEMPLATE_PROMPTS` in the backend. */
-const TEMPLATE_TYPES = ['SOAP Note', 'Clinic Note'] as const;
-type TemplateType = (typeof TEMPLATE_TYPES)[number];
+  EMPTY_PROFILE,
+  LIST_MODULES,
+  fetchDashboard,
+  linesToList,
+  listToLines,
+  patchProfile,
+  type PatientDemographics,
+  type PatientProfileModule,
+  type PatientProfileSchema,
+} from '@/lib/patientProfile';
 
 /**
- * Main pilot screen: ambient dictation + image/context capture, patient +
- * template selection, and a "Generate Output" action that emits
- * `generateDocument`. A global `uiStateChange` listener renders whatever
- * document the backend pushes back once generation finishes.
+ * Outpatient Dashboard (Phase 6).
+ *
+ * "Deterministic Read": the whole grid is hydrated from a single
+ * `GET /api/patients/:identifier/dashboard` (decrypted JSON, no AI).
+ * "Human-in-the-Loop Write": every card has inline editing that PATCHes its
+ * module back through `patchProfile` - the clinician's manual override.
+ *
+ * Layout: a fixed left column (Demographics on top, Allergies on the bottom),
+ * a top navigation row to the other patient pages, and a 2x3 grid of the
+ * remaining modules (Medical / Surgical history, Meds / Social history, and
+ * the Specialty Snapshot).
  */
-export default function HomeScreen() {
-  const [generatedDocument, setGeneratedDocument] = useState<MedicalDocument | null>(null);
-  const [isConnected, setIsConnected] = useState(socket.connected);
 
-  const [transcript, setTranscript] = useState('');
-  const [freeText, setFreeText] = useState('');
-  const [images, setImages] = useState<DocumentImageRef[]>([]);
-  const [patientIdentifier, setPatientIdentifier] = useState('');
-  const [templateType, setTemplateType] = useState<TemplateType>('SOAP Note');
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [generateError, setGenerateError] = useState<string | null>(null);
+const NAV_LINKS = [
+  { href: '/notes', label: 'Notes' },
+  { href: '/images', label: 'Images' },
+  { href: '/labs', label: 'Labs' },
+  { href: '/cardiac', label: 'Cardiac' },
+] as const;
 
-  useEffect(() => {
-    connectSocket();
+const DEMOGRAPHIC_FIELDS: { key: keyof PatientDemographics; label: string }[] = [
+  { key: 'fullName', label: 'Name' },
+  { key: 'dateOfBirth', label: 'Date of Birth' },
+  { key: 'age', label: 'Age' },
+  { key: 'sex', label: 'Sex' },
+  { key: 'mrn', label: 'MRN' },
+  { key: 'phone', label: 'Phone' },
+  { key: 'preferredLanguage', label: 'Preferred Language' },
+];
 
-    const onConnect = () => setIsConnected(true);
-    const onDisconnect = () => setIsConnected(false);
-    const onUiStateChange = (event: UiStateChangeEvent) => {
-      setIsGenerating(false);
-      const parsed = parseMedicalDocument(event?.note);
-      if (parsed) setGeneratedDocument(parsed);
-    };
-    const onTranscriptError = (message: unknown) => {
-      setIsGenerating(false);
-      setGenerateError(typeof message === 'string' ? message : 'Failed to generate document.');
-    };
+export default function DashboardScreen() {
+  const router = useRouter();
 
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('uiStateChange', onUiStateChange);
-    socket.on('transcriptError', onTranscriptError);
-    setIsConnected(socket.connected);
+  const [identifierInput, setIdentifierInput] = useState('');
+  const [loadedIdentifier, setLoadedIdentifier] = useState<string | null>(null);
+  const [profile, setProfile] = useState<PatientProfileSchema>(EMPTY_PROFILE);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savingModule, setSavingModule] = useState<PatientProfileModule | null>(null);
 
-    return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('uiStateChange', onUiStateChange);
-      socket.off('transcriptError', onTranscriptError);
-    };
+  const load = useCallback(async (identifier: string) => {
+    const id = identifier.trim();
+    if (!id) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetchDashboard(id);
+      setProfile({ ...EMPTY_PROFILE, ...res.profile });
+      setLoadedIdentifier(res.patient.patientIdentifier);
+    } catch (err) {
+      setError((err as Error).message);
+      setLoadedIdentifier(null);
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
-  const handleGenerate = useCallback(() => {
-    setGenerateError(null);
-
-    if (!patientIdentifier.trim()) {
-      setGenerateError('Enter a patient identifier (e.g. MRN) before generating.');
-      return;
-    }
-    if (!transcript.trim() && !freeText.trim() && images.length === 0) {
-      setGenerateError('Record a dictation, add context, or attach an image first.');
-      return;
-    }
-
-    setIsGenerating(true);
-    connectSocket();
-    socket.emit('generateDocument', {
-      transcript,
-      freeText,
-      images,
-      templateType,
-      patientIdentifier: patientIdentifier.trim(),
-    });
-  }, [transcript, freeText, images, templateType, patientIdentifier]);
+  const save = useCallback(
+    async (module: PatientProfileModule, value: unknown) => {
+      if (!loadedIdentifier) return;
+      setSavingModule(module);
+      setError(null);
+      try {
+        const res = await patchProfile(loadedIdentifier, {
+          [module]: value,
+        } as Partial<PatientProfileSchema>);
+        setProfile({ ...EMPTY_PROFILE, ...res.profile });
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setSavingModule(null);
+      }
+    },
+    [loadedIdentifier],
+  );
 
   return (
     <SafeAreaView className="flex-1 bg-slate-950">
       <ScrollView className="flex-1" contentContainerClassName="gap-4 p-4">
-        <View className="gap-1">
-          <Text className="text-2xl font-bold text-white">ActusMD</Text>
-          <View className="flex-row items-center gap-2">
-            <View
-              className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-slate-600'}`}
-            />
-            <Text className="text-xs text-slate-400">
-              {isConnected ? 'Connected to backend' : 'Offline'}
-            </Text>
-          </View>
-        </View>
-
-        <AudioDictation onTranscriptChange={setTranscript} />
-        <WebUpload onImagesChange={setImages} onFreeTextChange={setFreeText} />
-
-        <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
-          <Text className="text-base font-semibold text-slate-100">Generate Output</Text>
-
-          <View className="gap-1">
-            <Text className="text-xs uppercase tracking-wide text-slate-400">
-              Patient Identifier (MRN)
-            </Text>
+        {/* Header + patient loader */}
+        <View className="gap-2">
+          <Text className="text-2xl font-bold text-white">Outpatient Dashboard</Text>
+          <View className="flex-row flex-wrap items-center gap-2">
             <TextInput
-              value={patientIdentifier}
-              onChangeText={setPatientIdentifier}
-              placeholder="e.g. MRN-10293"
+              value={identifierInput}
+              onChangeText={setIdentifierInput}
+              onSubmitEditing={() => load(identifierInput)}
+              placeholder="Patient identifier (MRN)"
               placeholderTextColor="#64748b"
               autoCapitalize="characters"
-              className="rounded-lg bg-black/30 p-3 text-sm text-slate-100"
+              className="min-w-[200px] flex-1 rounded-lg bg-black/30 p-3 text-sm text-slate-100"
             />
+            <Pressable
+              onPress={() => load(identifierInput)}
+              disabled={isLoading}
+              className={`items-center rounded-lg bg-blue-600 px-4 py-3 ${
+                isLoading ? 'opacity-60' : ''
+              }`}>
+              <Text className="text-sm font-semibold text-white">
+                {isLoading ? 'Loading…' : 'Load'}
+              </Text>
+            </Pressable>
           </View>
-
-          <View className="gap-1">
-            <Text className="text-xs uppercase tracking-wide text-slate-400">Output Template</Text>
-            <View className="flex-row gap-2">
-              {TEMPLATE_TYPES.map((type) => (
-                <Pressable
-                  key={type}
-                  onPress={() => setTemplateType(type)}
-                  className={`flex-1 items-center rounded-lg px-3 py-2 ${
-                    templateType === type ? 'bg-blue-600' : 'bg-white/10'
-                  }`}>
-                  <Text
-                    className={`text-sm font-medium ${
-                      templateType === type ? 'text-white' : 'text-slate-300'
-                    }`}>
-                    {type}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
-
-          <Pressable
-            disabled={isGenerating}
-            onPress={handleGenerate}
-            className={`items-center rounded-xl bg-emerald-600 px-4 py-3 active:opacity-80 ${
-              isGenerating ? 'opacity-60' : ''
-            }`}>
-            <Text className="font-semibold text-white">
-              {isGenerating ? 'Generating…' : 'Generate Output'}
-            </Text>
-          </Pressable>
-
-          {isGenerating ? <ActivityIndicator color="#6ee7b7" /> : null}
-          {generateError ? <Text className="text-sm text-red-400">{generateError}</Text> : null}
-        </View>
-
-        <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
-          <Text className="text-base font-semibold text-slate-100">
-            {generatedDocument?.templateType ?? 'Generated Document'}
-          </Text>
-
-          {!generatedDocument ? (
-            <Text className="text-sm text-slate-500">
-              The final document pushed from the backend will appear here after you generate it.
+          {loadedIdentifier ? (
+            <Text className="text-xs text-slate-400">
+              Showing {loadedIdentifier}
+              {profile.lastUpdated
+                ? ` · updated ${new Date(profile.lastUpdated).toLocaleString()}`
+                : ''}
             </Text>
           ) : (
-            <View className="gap-3">
-              {(generatedDocument.sections ?? []).map((section) => (
-                <View key={section.heading} className="gap-1">
-                  <Text className="text-xs uppercase tracking-wide text-blue-300">
-                    {section.heading}
-                  </Text>
-                  <Text className="text-sm text-slate-100">
-                    {section.content || 'Not documented'}
-                  </Text>
+            <Text className="text-xs text-slate-500">
+              Enter a patient identifier to load the dashboard. New identifiers start empty and
+              can be filled in inline.
+            </Text>
+          )}
+          {error ? <Text className="text-sm text-red-400">{error}</Text> : null}
+        </View>
+
+        {/* Top navigation row */}
+        <View className="flex-row flex-wrap gap-2">
+          <View className="rounded-lg bg-blue-600 px-3 py-2">
+            <Text className="text-sm font-semibold text-white">Dashboard</Text>
+          </View>
+          {NAV_LINKS.map((link) => (
+            <Pressable
+              key={link.href}
+              onPress={() => router.push(link.href)}
+              className="rounded-lg bg-white/10 px-3 py-2 active:opacity-70">
+              <Text className="text-sm font-medium text-slate-200">{link.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {isLoading && !loadedIdentifier ? <ActivityIndicator color="#93c5fd" /> : null}
+
+        {loadedIdentifier ? (
+          <View className="gap-4" style={rowOnWideStyle}>
+            {/* Fixed left column: Demographics (top) + Allergies (bottom) */}
+            <View className="gap-4" style={leftColumnStyle}>
+              <DemographicsCard
+                demographics={profile.demographics}
+                saving={savingModule === 'demographics'}
+                onSave={(next) => save('demographics', next)}
+              />
+              <ListCard
+                title="Allergies"
+                accent="text-red-300"
+                items={profile.allergies}
+                saving={savingModule === 'allergies'}
+                onSave={(next) => save('allergies', next)}
+              />
+            </View>
+
+            {/* 2x3 grid of the remaining modules */}
+            <View className="flex-1 flex-row flex-wrap gap-4">
+              {LIST_MODULES.map((m) => (
+                <View key={m.key} style={gridCellStyle}>
+                  <ListCard
+                    title={m.label}
+                    items={profile[m.key]}
+                    saving={savingModule === m.key}
+                    onSave={(next) => save(m.key, next)}
+                  />
                 </View>
               ))}
-
-              {generatedDocument.icd10Suggestions && generatedDocument.icd10Suggestions.length > 0 ? (
-                <View className="gap-1">
-                  <Text className="text-xs uppercase tracking-wide text-blue-300">
-                    ICD-10 Suggestions
-                  </Text>
-                  {generatedDocument.icd10Suggestions.map((suggestion) => (
-                    <Text key={suggestion.code} className="text-sm text-slate-100">
-                      {suggestion.code} — {suggestion.description}
-                    </Text>
-                  ))}
-                </View>
-              ) : null}
-
-              {generatedDocument.redFlags && generatedDocument.redFlags.length > 0 ? (
-                <View className="gap-1">
-                  <Text className="text-xs uppercase tracking-wide text-red-400">Red Flags</Text>
-                  {generatedDocument.redFlags.map((flag) => (
-                    <Text key={flag} className="text-sm text-red-300">{`• ${flag}`}</Text>
-                  ))}
-                </View>
-              ) : null}
+              <View style={fullRowCellStyle}>
+                <SpecialtyCard
+                  snapshot={profile.specialtySnapshot}
+                  saving={savingModule === 'specialtySnapshot'}
+                  onSave={(next) => save('specialtySnapshot', next)}
+                />
+              </View>
             </View>
-          )}
-        </View>
+          </View>
+        ) : null}
+
+        {loadedIdentifier ? (
+          <SummaryCard
+            summary={profile.summary}
+            saving={savingModule === 'summary'}
+            onSave={(next) => save('summary', next)}
+          />
+        ) : null}
+
+        <Link href="/notes" className="pt-2 text-sm font-semibold text-blue-400">
+          Go to charting →
+        </Link>
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+// --- Layout styles (flexbox math kept out of NativeWind arbitrary values) ---
+
+const rowOnWideStyle: ViewStyle = { flexDirection: 'row', flexWrap: 'wrap' };
+const leftColumnStyle: ViewStyle = { flexGrow: 0, flexShrink: 0, flexBasis: 280, minWidth: 260 };
+const gridCellStyle: ViewStyle = { flexGrow: 1, flexBasis: 260, minWidth: 240 };
+const fullRowCellStyle: ViewStyle = { flexGrow: 1, flexBasis: '100%' };
+
+// --- Cards ----------------------------------------------------------------
+
+function CardShell({
+  title,
+  accent,
+  editing,
+  saving,
+  onToggleEdit,
+  onSave,
+  onCancel,
+  children,
+}: {
+  title: string;
+  accent?: string;
+  editing: boolean;
+  saving: boolean;
+  onToggleEdit: () => void;
+  onSave: () => void;
+  onCancel: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
+      <View className="flex-row items-center justify-between">
+        <Text className={`text-sm font-semibold ${accent ?? 'text-slate-100'}`}>{title}</Text>
+        {editing ? (
+          <View className="flex-row gap-2">
+            <Pressable onPress={onCancel} disabled={saving}>
+              <Text className="text-xs text-slate-400">Cancel</Text>
+            </Pressable>
+            <Pressable onPress={onSave} disabled={saving}>
+              <Text className="text-xs font-semibold text-emerald-400">
+                {saving ? 'Saving…' : 'Save'}
+              </Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Pressable onPress={onToggleEdit}>
+            <Text className="text-xs font-semibold text-blue-400">Edit</Text>
+          </Pressable>
+        )}
+      </View>
+      {children}
+    </View>
+  );
+}
+
+function ListCard({
+  title,
+  items,
+  accent,
+  saving,
+  onSave,
+}: {
+  title: string;
+  items: string[];
+  accent?: string;
+  saving: boolean;
+  onSave: (next: string[]) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+
+  const beginEdit = () => {
+    setDraft(listToLines(items));
+    setEditing(true);
+  };
+  const commit = () => {
+    onSave(linesToList(draft));
+    setEditing(false);
+  };
+
+  return (
+    <CardShell
+      title={title}
+      accent={accent}
+      editing={editing}
+      saving={saving}
+      onToggleEdit={beginEdit}
+      onSave={commit}
+      onCancel={() => setEditing(false)}>
+      {editing ? (
+        <TextInput
+          multiline
+          value={draft}
+          onChangeText={setDraft}
+          placeholder="One entry per line"
+          placeholderTextColor="#64748b"
+          className="min-h-24 rounded-lg bg-black/30 p-3 text-sm text-slate-100"
+          style={{ textAlignVertical: 'top' }}
+        />
+      ) : items.length === 0 ? (
+        <Text className="text-sm text-slate-500">Not documented</Text>
+      ) : (
+        <View className="gap-1">
+          {items.map((item, i) => (
+            <Text key={`${item}-${i}`} className="text-sm text-slate-100">
+              {`• ${item}`}
+            </Text>
+          ))}
+        </View>
+      )}
+    </CardShell>
+  );
+}
+
+function DemographicsCard({
+  demographics,
+  saving,
+  onSave,
+}: {
+  demographics: PatientDemographics;
+  saving: boolean;
+  onSave: (next: PatientDemographics) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+
+  const beginEdit = () => {
+    const seed: Record<string, string> = {};
+    DEMOGRAPHIC_FIELDS.forEach((f) => {
+      seed[f.key as string] = String(demographics?.[f.key] ?? '');
+    });
+    setDraft(seed);
+    setEditing(true);
+  };
+  const commit = () => {
+    const next: PatientDemographics = {};
+    DEMOGRAPHIC_FIELDS.forEach((f) => {
+      next[f.key] = (draft[f.key as string] ?? '').trim();
+    });
+    onSave(next);
+    setEditing(false);
+  };
+
+  return (
+    <CardShell
+      title="Demographics"
+      editing={editing}
+      saving={saving}
+      onToggleEdit={beginEdit}
+      onSave={commit}
+      onCancel={() => setEditing(false)}>
+      <View className="gap-2">
+        {DEMOGRAPHIC_FIELDS.map((f) => (
+          <View key={f.key as string} className="gap-1">
+            <Text className="text-xs uppercase tracking-wide text-slate-400">{f.label}</Text>
+            {editing ? (
+              <TextInput
+                value={draft[f.key as string] ?? ''}
+                onChangeText={(t) => setDraft((d) => ({ ...d, [f.key as string]: t }))}
+                placeholder="—"
+                placeholderTextColor="#64748b"
+                className="rounded-lg bg-black/30 p-2 text-sm text-slate-100"
+              />
+            ) : (
+              <Text className="text-sm text-slate-100">
+                {String(demographics?.[f.key] ?? '') || '—'}
+              </Text>
+            )}
+          </View>
+        ))}
+      </View>
+    </CardShell>
+  );
+}
+
+function SpecialtyCard({
+  snapshot,
+  saving,
+  onSave,
+}: {
+  snapshot: PatientProfileSchema['specialtySnapshot'];
+  saving: boolean;
+  onSave: (next: { focus: string; items: string[] }) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [focusDraft, setFocusDraft] = useState('');
+  const [itemsDraft, setItemsDraft] = useState('');
+
+  const beginEdit = () => {
+    setFocusDraft(snapshot?.focus ?? '');
+    setItemsDraft(listToLines(snapshot?.items));
+    setEditing(true);
+  };
+  const commit = () => {
+    onSave({ focus: focusDraft.trim(), items: linesToList(itemsDraft) });
+    setEditing(false);
+  };
+
+  return (
+    <CardShell
+      title="Specialty Snapshot"
+      editing={editing}
+      saving={saving}
+      onToggleEdit={beginEdit}
+      onSave={commit}
+      onCancel={() => setEditing(false)}>
+      {editing ? (
+        <View className="gap-2">
+          <TextInput
+            value={focusDraft}
+            onChangeText={setFocusDraft}
+            placeholder="Focus (e.g. Cardiology)"
+            placeholderTextColor="#64748b"
+            className="rounded-lg bg-black/30 p-2 text-sm text-slate-100"
+          />
+          <TextInput
+            multiline
+            value={itemsDraft}
+            onChangeText={setItemsDraft}
+            placeholder="One entry per line"
+            placeholderTextColor="#64748b"
+            className="min-h-24 rounded-lg bg-black/30 p-3 text-sm text-slate-100"
+            style={{ textAlignVertical: 'top' }}
+          />
+        </View>
+      ) : (
+        <View className="gap-1">
+          {snapshot?.focus ? (
+            <Text className="text-xs uppercase tracking-wide text-blue-300">{snapshot.focus}</Text>
+          ) : null}
+          {(snapshot?.items ?? []).length === 0 ? (
+            <Text className="text-sm text-slate-500">Not documented</Text>
+          ) : (
+            (snapshot?.items ?? []).map((item, i) => (
+              <Text key={`${item}-${i}`} className="text-sm text-slate-100">{`• ${item}`}</Text>
+            ))
+          )}
+        </View>
+      )}
+    </CardShell>
+  );
+}
+
+function SummaryCard({
+  summary,
+  saving,
+  onSave,
+}: {
+  summary: string;
+  saving: boolean;
+  onSave: (next: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+
+  const beginEdit = () => {
+    setDraft(summary ?? '');
+    setEditing(true);
+  };
+  const commit = () => {
+    onSave(draft.trim());
+    setEditing(false);
+  };
+
+  return (
+    <CardShell
+      title="Summary"
+      editing={editing}
+      saving={saving}
+      onToggleEdit={beginEdit}
+      onSave={commit}
+      onCancel={() => setEditing(false)}>
+      {editing ? (
+        <TextInput
+          multiline
+          value={draft}
+          onChangeText={setDraft}
+          placeholder="Short narrative overview"
+          placeholderTextColor="#64748b"
+          className="min-h-20 rounded-lg bg-black/30 p-3 text-sm text-slate-100"
+          style={{ textAlignVertical: 'top' }}
+        />
+      ) : (
+        <Text className="text-sm text-slate-100">{summary || 'Not documented'}</Text>
+      )}
+    </CardShell>
   );
 }

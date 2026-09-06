@@ -5,6 +5,8 @@
  * `socketManager.ts`.
  */
 
+import type { PatientProfileSchema } from '@/lib/patientProfile';
+
 export interface Icd10Suggestion {
   code: string;
   description: string;
@@ -54,6 +56,30 @@ export interface UiStateChangeEvent {
   note?: ClinicalNoteRow;
   patient?: PatientRow;
   [key: string]: unknown;
+}
+
+/**
+ * Validation Gate step 1: the backend's `documentProposed` payload. Nothing is
+ * persisted yet - the client renders the draft + the proposed profile updates
+ * and echoes them back on `commitDocument`.
+ */
+export interface DocumentProposedEvent {
+  draftNote: MedicalDocument;
+  /** The model's proposed FULL updated profile for this patient. */
+  profileDiff: PatientProfileSchema;
+  /** The profile as it stands today, for side-by-side review. */
+  existingProfile: PatientProfileSchema;
+  patient: { id: string; patientIdentifier: string };
+  templateType?: string;
+  sessionId?: string;
+}
+
+/** Validation Gate step 2: the backend's `documentCommitted` payload. */
+export interface DocumentCommittedEvent {
+  type?: string;
+  note?: ClinicalNoteRow;
+  patient?: PatientRow;
+  profile?: PatientProfileSchema | null;
 }
 
 /** Parse the serialized document content, returning null on malformed input. */

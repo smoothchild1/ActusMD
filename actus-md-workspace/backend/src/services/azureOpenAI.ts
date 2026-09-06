@@ -2,6 +2,11 @@ import fs from 'fs/promises';
 import { AzureOpenAI } from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionContentPart } from 'openai/resources/chat/completions';
 import { buildPatientContextBlock } from './patientContext';
+import {
+  buildProfileContextBlock,
+  normalizePatientProfile,
+  type PatientProfileSchema,
+} from '../types/patientProfile';
 
 /**
  * Azure OpenAI - multimodal (image + text) -> structured JSON medical document.
@@ -71,6 +76,14 @@ export interface MedicalDocumentRequest {
    * model longitudinal context beyond this single encounter.
    */
   patientId?: string;
+  /**
+   * The patient's existing `PatientProfileSchema` (the 6-module dashboard
+   * profile). When present it is injected into the system prompt as
+   * historical context and the model returns a proposed `profileDiff`
+   * folding this encounter into it. Takes precedence over `patientId`'s
+   * `buildPatientContextBlock` when both are supplied.
+   */
+  existingProfile?: PatientProfileSchema;
 }
 
 export interface MedicalDocumentSection {
@@ -90,13 +103,42 @@ export interface MedicalDocument extends GeneratedDocumentBody {
   templateType: TemplateType;
 }
 
-const JSON_SHAPE_RULES = `Respond with ONLY minified JSON matching this shape:
-{"sections":[{"heading":string,"content":string}, ...],
-"icd10Suggestions":[{"code":string,"description":string}],"followUp":string,"redFlags":[string]}
-Rules:
+/**
+ * The Validation Gate payload. The model never writes to the database - it
+ * proposes a `draftNote` (the structured clinical document) plus a
+ * `profileDiff` (the patient's `PatientProfileSchema` with this encounter
+ * folded in). Both are emitted to the client for review; nothing is persisted
+ * until the clinician accepts via `commitDocument`.
+ */
+export interface DraftAndProfileDiff {
+  draftNote: MedicalDocument;
+  profileDiff: PatientProfileSchema;
+}
+
+const PROFILE_DIFF_SHAPE =
+  '{"demographics":{"fullName":string,"dateOfBirth":string,"age":string,"sex":string,' +
+  '"mrn":string,"phone":string,"preferredLanguage":string},' +
+  '"allergies":[string],"medicalHistory":[string],"surgicalHistory":[string],' +
+  '"medications":[string],"socialHistory":[string],' +
+  '"specialtySnapshot":{"focus":string,"items":[string]},"summary":string}';
+
+const JSON_SHAPE_RULES = `Respond with ONLY minified JSON matching this exact shape:
+{"draftNote":{"sections":[{"heading":string,"content":string}, ...],
+"icd10Suggestions":[{"code":string,"description":string}],"followUp":string,"redFlags":[string]},
+"profileDiff":${PROFILE_DIFF_SHAPE}}
+Rules for "draftNote":
 - Do not invent findings that are not supported by the transcript, images, or provided context.
 - Use "Not documented" for any section with no supporting information.
-- Keep clinical language concise and professional.`;
+- Keep clinical language concise and professional.
+Rules for "profileDiff":
+- Start from the EXISTING PATIENT PROFILE block if one is provided and return the FULL updated
+  profile, not just the changes: carry every existing entry forward unless this encounter
+  clearly supersedes or resolves it.
+- Add only new problems, medications, allergies, surgical/social history, or demographics that
+  this encounter actually establishes. Never fabricate.
+- If no existing profile is provided, populate it solely from what this encounter supports and
+  leave the rest empty ([] or "").
+- Keep "summary" to 2-4 sentences describing the patient's overall clinical picture.`;
 
 /** System prompt per template type. Each defines the section headings the model must produce. */
 const TEMPLATE_PROMPTS: Record<string, string> = {
@@ -132,15 +174,30 @@ async function toImagePart(img: DocumentImageInput): Promise<ChatCompletionConte
   throw new Error('Image input requires either "path" or "url".');
 }
 
+interface ParsedGeneration {
+  draftNote?: Partial<GeneratedDocumentBody>;
+  profileDiff?: unknown;
+  // Tolerate a model that forgets the wrapper and returns a bare note body.
+  sections?: MedicalDocumentSection[];
+}
+
 /**
- * Send the multimodal payload to Azure OpenAI and parse the JSON medical document,
- * using the system prompt for the requested `templateType`. When `req.patientId`
- * is set, the patient's Living Profile + recent Artifacts are fetched from
- * Postgres and appended to the system prompt for longitudinal context.
+ * Send the multimodal payload to Azure OpenAI and parse the Validation Gate
+ * response, using the system prompt for the requested `templateType`.
+ *
+ * Historical context injection (Step 2): when `req.existingProfile` is set, the
+ * patient's `PatientProfileSchema` is rendered into the system prompt so the
+ * model can (a) write a better-informed `draftNote` and (b) return a
+ * `profileDiff` that folds this encounter into the existing profile. When only
+ * `req.patientId` is set, the older `buildPatientContextBlock` (Living Profile
+ * + recent Artifacts) is used instead.
+ *
+ * Nothing is persisted here - the caller (`socketManager`) emits the result to
+ * the client and only writes to the database on `commitDocument`.
  */
 export async function generateMedicalDocument(
   req: MedicalDocumentRequest,
-): Promise<MedicalDocument> {
+): Promise<DraftAndProfileDiff> {
   const oai = getOpenAIClient();
 
   const userContent: ChatCompletionContentPart[] = [
@@ -158,9 +215,14 @@ export async function generateMedicalDocument(
     userContent.push(await toImagePart(img));
   }
 
-  const patientContextBlock = req.patientId ? await buildPatientContextBlock(req.patientId) : '';
-  const systemPrompt = patientContextBlock
-    ? `${getSystemPrompt(req.templateType)}\n\n${patientContextBlock}`
+  let contextBlock = '';
+  if (req.existingProfile) {
+    contextBlock = buildProfileContextBlock(req.existingProfile);
+  } else if (req.patientId) {
+    contextBlock = await buildPatientContextBlock(req.patientId);
+  }
+  const systemPrompt = contextBlock
+    ? `${getSystemPrompt(req.templateType)}\n\n${contextBlock}`
     : getSystemPrompt(req.templateType);
 
   const messages: ChatCompletionMessageParam[] = [
@@ -173,14 +235,32 @@ export async function generateMedicalDocument(
       model: DEPLOYMENT,
       messages: messages,
       temperature: 0.2,
-      max_completion_tokens: 1500,
+      max_completion_tokens: 2000,
       response_format: { type: 'json_object' },
     });
 
     const raw = result.choices[0]?.message?.content ?? '';
+    // Strip markdown fences before JSON.parse (see IMPLEMENTATION_PLAN gotcha).
     const rawCleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(rawCleaned) as GeneratedDocumentBody;
-    return { ...parsed, templateType: req.templateType };
+    const parsed = JSON.parse(rawCleaned) as ParsedGeneration;
+
+    const noteBody: Partial<GeneratedDocumentBody> = parsed.draftNote
+      ?? (parsed.sections ? { sections: parsed.sections } : {});
+
+    const draftNote: MedicalDocument = {
+      sections: Array.isArray(noteBody.sections) ? noteBody.sections : [],
+      icd10Suggestions: noteBody.icd10Suggestions,
+      followUp: noteBody.followUp,
+      redFlags: noteBody.redFlags,
+      templateType: req.templateType,
+    };
+
+    // Fold onto the existing profile so the diff is always the FULL updated
+    // profile even if the model only returned changed fields.
+    const base = req.existingProfile ?? {};
+    const profileDiff = normalizePatientProfile({ ...base, ...(parsed.profileDiff as object ?? {}) });
+
+    return { draftNote, profileDiff };
   } catch (err: any) {
     // eslint-disable-next-line no-console
     console.error('[azureOpenAI] generateMedicalDocument failed:', err?.message || err);

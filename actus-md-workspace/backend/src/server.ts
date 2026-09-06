@@ -6,6 +6,7 @@ import cors from 'cors';
 import express from 'express';
 import { Server } from 'socket.io';
 
+import patientsRouter from './routes/patients';
 import uploadRouter from './routes/upload';
 import { setupSockets } from './sockets/socketManager';
 import { prisma } from './services/db';
@@ -32,6 +33,7 @@ app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
 
 // REST routes.
 app.use('/api/upload', uploadRouter);
+app.use('/api/patients', patientsRouter);
 
 app.get('/health', (_req, res) => {
   res.json({

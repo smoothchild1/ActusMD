@@ -5,8 +5,15 @@ import {
   type SpeechStreamSession,
 } from '../services/azureSpeech';
 import { prisma } from '../services/db';
-import { generateMedicalDocument, type DocumentImageInput, type TemplateType } from '../services/azureOpenAI';
+import { generateMedicalDocument, type DocumentImageInput, type MedicalDocument, type TemplateType } from '../services/azureOpenAI';
 import { writeAuditLog } from '../middleware/auditMiddleware';
+import {
+  emptyProfile,
+  mergeProfileModules,
+  parsePatientProfile,
+  serializePatientProfile,
+  type PatientProfileSchema,
+} from '../types/patientProfile';
 
 /**
  * Socket.io wiring for ActusMD.
@@ -18,9 +25,15 @@ import { writeAuditLog } from '../middleware/auditMiddleware';
  *                             back to the room as `transcriptUpdate`.
  *  - `audioStop`           -> finalizes the transcript only, emitting
  *                             `transcriptFinalized`. Does not call the AI.
- *  - `generateDocument`    -> takes a finalized payload (transcript, images,
- *                             free text, template, patient) and produces +
- *                             persists the AI document, emitting `uiStateChange`.
+ *  - `generateDocument`    -> "Human-in-the-Loop Write" step 1: reads the
+ *                             patient's existing PatientProfile for historical
+ *                             context, calls the AI, and emits the proposed
+ *                             `{ draftNote, profileDiff }` back as
+ *                             `documentProposed`. NOTHING is persisted here.
+ *  - `commitDocument`      -> step 2, fired when the clinician clicks
+ *                             "Sign & Accept": creates the ClinicalNote and
+ *                             upserts the PatientProfile, then emits
+ *                             `documentCommitted` (+ `uiStateChange`).
  *  - `uiStateChange`       -> relayed to the user's *other* devices to keep the UI
  *                             in sync across phone / tablet / web.
  */
@@ -39,6 +52,16 @@ interface GenerateDocumentPayload {
   freeText?: string;
   templateType?: TemplateType;
   patientIdentifier?: string;
+  sessionId?: string;
+}
+
+interface CommitDocumentPayload {
+  patientIdentifier?: string;
+  templateType?: TemplateType;
+  /** The structured note the clinician reviewed (and possibly edited). */
+  draftNote?: MedicalDocument;
+  /** The proposed profile the clinician reviewed (and possibly edited). */
+  profileDiff?: PatientProfileSchema;
   sessionId?: string;
 }
 
@@ -103,6 +126,7 @@ export function setupSockets(io: Server): void {
       });
     };
 
+    // --- Validation Gate step 1: propose, do not persist ------------------
     const generateDocument = async (payload: GenerateDocumentPayload): Promise<void> => {
       const transcript = payload?.transcript?.trim() ?? '';
       const freeText = payload?.freeText?.trim();
@@ -127,24 +151,70 @@ export function setupSockets(io: Server): void {
           where: { patientIdentifier },
           update: {},
           create: { patientIdentifier },
+          include: { profile: true },
         });
 
-        // generateMedicalDocument reads the patient's Living Profile + recent
-        // Artifacts (Step 5 context injection) before calling the LLM - log
-        // that PHI read here, at the request boundary where we know `userId`.
+        const existingProfile: PatientProfileSchema = patient.profile
+          ? parsePatientProfile(patient.profile.synthesizedData)
+          : emptyProfile();
+
+        // generateMedicalDocument reads the patient's existing profile for
+        // historical context before calling the LLM - log that PHI read here,
+        // at the request boundary where we know `userId`.
         void writeAuditLog({
           userId,
           action: 'READ',
-          resource: 'PatientContext',
+          resource: 'PatientProfile',
           patientId: patient.id,
         });
 
-        const document = await generateMedicalDocument({
+        const { draftNote, profileDiff } = await generateMedicalDocument({
           transcript,
           patientContext: freeText,
           images: payload?.images,
           templateType,
-          patientId: patient.id,
+          existingProfile,
+        });
+
+        // Nothing persisted. The client renders the draft + the proposed
+        // profile updates and echoes them back on `commitDocument`.
+        io.to(userId).emit('documentProposed', {
+          draftNote,
+          profileDiff,
+          existingProfile,
+          patient: { id: patient.id, patientIdentifier: patient.patientIdentifier },
+          templateType,
+          sessionId: payload?.sessionId,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[socket] generateDocument failed:', err);
+        io.to(userId).emit('transcriptError', 'Failed to generate clinical document.');
+      }
+    };
+
+    // --- Validation Gate step 2: persist on "Sign & Accept" -------------
+    const commitDocument = async (payload: CommitDocumentPayload): Promise<void> => {
+      const patientIdentifier = payload?.patientIdentifier?.trim();
+      const templateType = payload?.templateType?.trim() || 'SOAP Note';
+      const draftNote = payload?.draftNote;
+      const profileDiff = payload?.profileDiff;
+
+      if (!patientIdentifier) {
+        io.to(userId).emit('transcriptError', 'A patient identifier is required to commit a document.');
+        return;
+      }
+      if (!draftNote || !Array.isArray(draftNote.sections)) {
+        io.to(userId).emit('transcriptError', 'A valid draft note is required to commit.');
+        return;
+      }
+
+      try {
+        const patient = await prisma.patient.upsert({
+          where: { patientIdentifier },
+          update: {},
+          create: { patientIdentifier },
+          include: { profile: true },
         });
 
         let sessionId = payload?.sessionId;
@@ -154,9 +224,7 @@ export function setupSockets(io: Server): void {
             update: {},
             create: { id: userId, email: `${userId}@dummy.local` },
           });
-          const newSession = await prisma.session.create({
-            data: { userId },
-          });
+          const newSession = await prisma.session.create({ data: { userId } });
           sessionId = newSession.id;
         }
 
@@ -164,7 +232,7 @@ export function setupSockets(io: Server): void {
           data: {
             sessionId,
             patientId: patient.id,
-            content: JSON.stringify(document),
+            content: JSON.stringify({ ...draftNote, templateType }),
           },
         });
 
@@ -176,10 +244,38 @@ export function setupSockets(io: Server): void {
           metadata: { clinicalNoteId: note.id, templateType },
         });
 
-        io.to(userId).emit('uiStateChange', { type: 'documentGenerated', note, patient });
+        // Deterministically fold the clinician-accepted profileDiff into the
+        // patient's current profile (pure merge, no LLM).
+        let profile: PatientProfileSchema | null = null;
+        if (profileDiff && typeof profileDiff === 'object') {
+          const current = patient.profile
+            ? parsePatientProfile(patient.profile.synthesizedData)
+            : emptyProfile();
+          profile = mergeProfileModules(current, profileDiff);
+          const synthesizedData = serializePatientProfile(profile);
+
+          await prisma.patientProfile.upsert({
+            where: { patientId: patient.id },
+            create: { patientId: patient.id, synthesizedData },
+            update: { synthesizedData },
+          });
+
+          void writeAuditLog({
+            userId,
+            action: 'UPDATE',
+            resource: 'PatientProfile',
+            patientId: patient.id,
+            metadata: { source: 'ai-commit', clinicalNoteId: note.id },
+          });
+        }
+
+        const result = { type: 'documentCommitted', note, patient, profile };
+        io.to(userId).emit('documentCommitted', result);
+        io.to(userId).emit('uiStateChange', result);
       } catch (err) {
-        console.error('[socket] generateDocument failed:', err);
-        io.to(userId).emit('transcriptError', 'Failed to generate clinical document.');
+        // eslint-disable-next-line no-console
+        console.error('[socket] commitDocument failed:', err);
+        io.to(userId).emit('transcriptError', 'Failed to commit clinical document.');
       }
     };
 
@@ -203,8 +299,9 @@ export function setupSockets(io: Server): void {
 
     socket.on('audioStop', (payload: AudioStopPayload) => finalizeTranscript(payload));
 
-    // --- AI document generation (patient/template selected client-side) ---
+    // --- AI document generation + commit (Validation Gate) -------------
     socket.on('generateDocument', (payload: GenerateDocumentPayload) => generateDocument(payload));
+    socket.on('commitDocument', (payload: CommitDocumentPayload) => commitDocument(payload));
 
     // --- Cross-device UI state sync -------------------------------------
     socket.on('uiStateChange', (state: unknown) => {
